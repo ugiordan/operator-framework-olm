@@ -151,11 +151,36 @@ func (i *StrategyDeploymentInstaller) EnsureConversionWebhooks() error {
 		if !ok || d.webhookDescription.Type != v1alpha1.ConversionWebhook {
 			continue
 		}
-		if err := i.createOrUpdateConversionWebhook(d.caPEM, d.webhookDescription); err != nil {
+
+		caPEM, err := i.conversionWebhookCAPEM(d)
+		if err != nil {
+			return err
+		}
+
+		if err := i.createOrUpdateConversionWebhook(caPEM, d.webhookDescription); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (i *StrategyDeploymentInstaller) conversionWebhookCAPEM(desc *webhookDescriptionWithCAPEM) ([]byte, error) {
+	if len(desc.caPEM) > 0 {
+		return desc.caPEM, nil
+	}
+
+	secretName := SecretName(ServiceName(desc.webhookDescription.DeploymentName))
+	secret, err := i.strategyClient.GetOpLister().CoreV1().SecretLister().Secrets(i.owner.GetNamespace()).Get(secretName)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get conversion webhook CA Secret %s: %w", secretName, err)
+	}
+
+	caPEM := secret.Data[OLMCAPEMKey]
+	if len(caPEM) == 0 {
+		return nil, fmt.Errorf("conversion webhook CA Secret %s does not contain %s", secretName, OLMCAPEMKey)
+	}
+	desc.caPEM = caPEM
+	return caPEM, nil
 }
 
 func (i *StrategyDeploymentInstaller) deploymentForSpec(name string, spec appsv1.DeploymentSpec, specLabels k8slabels.Set) (deployment *appsv1.Deployment, hash string, err error) {

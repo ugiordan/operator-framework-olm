@@ -414,6 +414,19 @@ func (a *Operator) getWebhookCABundle(csv *v1alpha1.ClusterServiceVersion, desc 
 			return existingWebhooks.Items[0].Webhooks[0].ClientConfig.CABundle, nil
 		}
 	case v1alpha1.ConversionWebhook:
+		// The deployment hash must use the CA associated with this webhook's
+		// deployment. During an upgrade, the CRD can still contain the previous
+		// webhook's CA while the replacement deployment already has a new Secret.
+		if desc.DeploymentName != "" {
+			secretName := install.SecretName(install.ServiceName(desc.DeploymentName))
+			secret, err := a.lister.CoreV1().SecretLister().Secrets(csv.GetNamespace()).Get(secretName)
+			if err == nil {
+				if caBundle, ok := secret.Data[install.OLMCAPEMKey]; ok && len(caBundle) > 0 {
+					return caBundle, nil
+				}
+			}
+		}
+
 		for _, conversionCRD := range desc.ConversionCRDs {
 			// check if CRD exists on cluster
 			crd, err := a.opClient.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), conversionCRD, metav1.GetOptions{})
@@ -535,7 +548,7 @@ func (a *Operator) cleanUpRemovedWebhooks(csv *v1alpha1.ClusterServiceVersion) e
 		}
 		if _, ok := csvWebhookGenerateNames[webhookGenerateNameLabel]; !ok {
 			err = a.opClient.KubernetesInterface().AdmissionregistrationV1().ValidatingWebhookConfigurations().Delete(context.TODO(), webhook.Name, metav1.DeleteOptions{})
-			if err != nil && apierrors.IsNotFound(err) {
+			if err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
@@ -553,7 +566,7 @@ func (a *Operator) cleanUpRemovedWebhooks(csv *v1alpha1.ClusterServiceVersion) e
 		}
 		if _, ok := csvWebhookGenerateNames[webhookGenerateNameLabel]; !ok {
 			err = a.opClient.KubernetesInterface().AdmissionregistrationV1().MutatingWebhookConfigurations().Delete(context.TODO(), webhook.Name, metav1.DeleteOptions{})
-			if err != nil && apierrors.IsNotFound(err) {
+			if err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
@@ -567,10 +580,6 @@ func (a *Operator) cleanUpRemovedWebhooks(csv *v1alpha1.ClusterServiceVersion) e
 // on the target CRDs using the provided installer, ensuring conversion is only activated
 // once the new deployment's pods are ready to serve /convert.
 func (a *Operator) areWebhooksAvailable(csv *v1alpha1.ClusterServiceVersion, installer install.StrategyInstaller) (bool, error) {
-	err := a.cleanUpRemovedWebhooks(csv)
-	if err != nil {
-		return false, err
-	}
 	for _, desc := range csv.Spec.WebhookDefinitions {
 		// Create Webhook Label Selector
 		webhookLabels := ownerutil.OwnerLabel(csv, v1alpha1.ClusterServiceVersionKind)

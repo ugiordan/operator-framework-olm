@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	appsv1applyconfigurations "k8s.io/client-go/applyconfigurations/apps/v1"
 	rbacv1applyconfigurations "k8s.io/client-go/applyconfigurations/rbac/v1"
 	"k8s.io/client-go/informers"
@@ -1300,12 +1301,18 @@ func (a *Operator) handleClusterServiceVersionDeletion(obj interface{}) {
 	// openapiv3 schema fails.
 	// As such, when a CSV is deleted OLM will check if it is being replaced. If the CSV is not being replaced, OLM will remove the conversion
 	// webhook from the CRD definition.
-	csvs, err := a.lister.OperatorsV1alpha1().ClusterServiceVersionLister().ClusterServiceVersions(clusterServiceVersion.GetNamespace()).List(labels.Everything())
+	var csvs []*v1alpha1.ClusterServiceVersion
+	err := wait.PollUntilContextCancel(a.ctx, time.Second, true, func(context.Context) (bool, error) {
+		var err error
+		csvs, err = a.lister.OperatorsV1alpha1().ClusterServiceVersionLister().ClusterServiceVersions(clusterServiceVersion.GetNamespace()).List(labels.Everything())
+		if err != nil {
+			logger.WithError(err).Warn("error listing csvs, retrying conversion webhook cleanup")
+			return false, nil
+		}
+		return true, nil
+	})
 	if err != nil {
-		// Without a complete CSV list we cannot safely determine which CRDs are still
-		// covered by a replacement CSV. Bail out to avoid incorrectly clearing
-		// spec.conversion on CRDs that a replacement still owns.
-		logger.Errorf("error listing csvs, skipping conversion webhook cleanup: %v\n", err)
+		logger.WithError(err).Warn("conversion webhook cleanup canceled")
 		return
 	}
 
@@ -2640,15 +2647,18 @@ func (a *Operator) updateInstallStatus(csv *v1alpha1.ClusterServiceVersion, inst
 		a.logger.WithError(strategyErr).Debug("operator not installed")
 	}
 
+	// Removed admission webhooks can be cleaned up before the deployment is ready.
+	// Keep this separate from areWebhooksAvailable because conversion webhooks must
+	// not be activated until the deployment is serving requests.
+	webhookErr := a.cleanUpRemovedWebhooks(csv)
 	apiServicesInstalled, apiServiceErr := a.areAPIServicesAvailable(csv)
 	// Only attempt to write spec.conversion once the deployment is confirmed ready.
 	// areWebhooksAvailable calls EnsureConversionWebhooks, so calling it when
 	// strategyInstalled is false would recreate the upgrade race we are fixing.
 	// Note: CheckInstalled never returns (true, non-nil error), so strategyInstalled
 	// is sufficient — no need to also gate on strategyErr.
-	webhooksInstalled := false
-	var webhookErr error
-	if strategyInstalled {
+	webhooksInstalled := true
+	if webhookErr == nil && strategyInstalled {
 		webhooksInstalled, webhookErr = a.areWebhooksAvailable(csv, installer)
 	}
 
